@@ -177,7 +177,7 @@ FfxCommandList ffxGetCommandListDX11(ID3D11DeviceContext* deviceContext)
 }
 
 // register a DX11 resource to the backend
-FfxResource ffxGetResourceDX11(ID3D11Resource* dx11Resource,
+FfxResource ffxGetResourceDX11(const ID3D11Resource* dx11Resource,
     FfxResourceDescription                     ffxResDescription,
     wchar_t const*                             ffxResName,
     FfxResourceStates                          state /*=FFX_RESOURCE_STATE_COMPUTE_READ*/)
