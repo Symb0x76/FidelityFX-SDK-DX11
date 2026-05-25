@@ -22,8 +22,11 @@
 
 #include <algorithm>    // for max used inside SPD CPU code.
 #include <cmath>        // for fabs, abs, sinf, sqrt, etc.
+#include <cstdlib>      // for wcstombs_s
+#include <cstring>      // for memset
 #include <string>       // for memset
 #include <cfloat>       // for FLT_EPSILON
+#include <spdlog/spdlog.h>
 #include <FidelityFX/host/ffx_frameinterpolation.h>
 
 #define FFX_CPU
@@ -91,6 +94,8 @@ static const ResourceBinding uavResourceBindingTable[] =
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_INPAINTING_MASK,                            L"rw_inpainting_mask"},
 
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_COUNTERS,                                   L"rw_counters"},
+    {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_INPAINTING_PYRAMID,                         L"rw_inpainting_pyramid_prev"},
+    {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_INPAINTING_PYRAMID,                         L"rw_inpainting_pyramid_dst"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_INPAINTING_PYRAMID_MIPMAP_0,                L"rw_inpainting_pyramid0"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_INPAINTING_PYRAMID_MIPMAP_1,                L"rw_inpainting_pyramid1"},
     {FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_INPAINTING_PYRAMID_MIPMAP_2,                L"rw_inpainting_pyramid2"},
@@ -230,6 +235,34 @@ static FfxErrorCode patchResourceBindings(FfxPipelineState* inoutPipeline)
     return FFX_OK;
 }
 
+static bool isPipelineValid(const FfxPipelineState* pipeline)
+{
+    return pipeline && pipeline->pipeline;
+}
+
+static bool isSerialInpaintingPyramidPipeline(const FfxPipelineState* pipeline)
+{
+    if (!isPipelineValid(pipeline)) {
+        return false;
+    }
+
+    bool hasPrev = false;
+    bool hasDst = false;
+    for (uint32_t i = 0; i < pipeline->uavTextureCount; ++i) {
+        hasPrev |= wcscmp(pipeline->uavTextureBindings[i].name, L"rw_inpainting_pyramid_prev") == 0;
+        hasDst |= wcscmp(pipeline->uavTextureBindings[i].name, L"rw_inpainting_pyramid_dst") == 0;
+    }
+
+    return hasPrev && hasDst;
+}
+
+static void clearPipelineState(FfxPipelineState* pipeline)
+{
+    if (pipeline) {
+        memset(pipeline, 0, sizeof(*pipeline));
+    }
+}
+
 static uint32_t getPipelinePermutationFlags(uint32_t contextFlags, FfxPass, bool fp16, bool force64, bool)
 {
     // work out what permutation to load.
@@ -306,6 +339,25 @@ static FfxErrorCode createPipelineStates(FfxFrameInterpolationContext_Private* c
         return FFX_OK;
     };
 
+    auto CreateOptionalComputePipeline = [&](FfxPass pass, const wchar_t* name, FfxPipelineState* pipeline) -> bool {
+        const FfxErrorCode errorCode = CreateComputePipeline(pass, name, pipeline);
+        if (errorCode == FFX_OK) {
+            return true;
+        }
+
+        ffxSafeReleasePipeline(&context->contextDescription.backendInterface, pipeline, context->effectContextId);
+        clearPipelineState(pipeline);
+
+        char nameA[128] = {};
+        size_t returnSize = 0;
+        wcstombs_s(&returnSize, nameA, sizeof(nameA), name, sizeof(nameA) - 1);
+        spdlog::warn("[FrameInterpolation] Optional pipeline '{}' unavailable on this backend (error={}); continuing without inpainting refinement",
+            nameA,
+            static_cast<int>(errorCode));
+        spdlog::default_logger()->flush();
+        return false;
+    };
+
     auto CreateRasterPipeline = [&](FfxPass pass, const wchar_t* name, FfxPipelineState* pipeline) -> FfxErrorCode {
         wcscpy_s(pipelineDescription.name, name);
         pipelineDescription.stage            = (FfxBindStage)(FFX_BIND_VERTEX_SHADER_STAGE | FFX_BIND_PIXEL_SHADER_STAGE);
@@ -323,17 +375,31 @@ static FfxErrorCode createPipelineStates(FfxFrameInterpolationContext_Private* c
     };
 
     // Frame Interpolation Pipelines
-    CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_RECONSTRUCT_AND_DILATE,               L"RECONSTRUCT_AND_DILATE", &context->pipelineFiReconstructAndDilate);
-    CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_SETUP,                                L"SETUP", &context->pipelineFiSetup);
-    CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_RECONSTRUCT_PREV_DEPTH,               L"RECONSTRUCT_PREV_DEPTH", &context->pipelineFiReconstructPreviousDepth);
-    CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_GAME_MOTION_VECTOR_FIELD,             L"GAME_MOTION_VECTOR_FIELD", &context->pipelineFiGameMotionVectorField);
-    CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_OPTICAL_FLOW_VECTOR_FIELD,            L"OPTICAL_FLOW_VECTOR_FIELD", &context->pipelineFiOpticalFlowVectorField);
-    CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_DISOCCLUSION_MASK,                    L"DISOCCLUSION_MASK", &context->pipelineFiDisocclusionMask);
-    CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_INTERPOLATION,                        L"INTERPOLATION", &context->pipelineFiScfi);
-    CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_INPAINTING_PYRAMID,                   L"INPAINTING_PYRAMID", &context->pipelineInpaintingPyramid);
-    CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_INPAINTING,                           L"INPAINTING", &context->pipelineInpainting);
-    CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_GAME_VECTOR_FIELD_INPAINTING_PYRAMID, L"GAME_VECTOR_FIELD_INPAINTING_PYRAMID", & context->pipelineGameVectorFieldInpaintingPyramid);
-    CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_DEBUG_VIEW,                           L"DEBUG_VIEW", &context->pipelineDebugView);
+    FFX_VALIDATE(CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_RECONSTRUCT_AND_DILATE,               L"RECONSTRUCT_AND_DILATE", &context->pipelineFiReconstructAndDilate));
+    FFX_VALIDATE(CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_SETUP,                                L"SETUP", &context->pipelineFiSetup));
+    FFX_VALIDATE(CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_RECONSTRUCT_PREV_DEPTH,               L"RECONSTRUCT_PREV_DEPTH", &context->pipelineFiReconstructPreviousDepth));
+    FFX_VALIDATE(CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_GAME_MOTION_VECTOR_FIELD,             L"GAME_MOTION_VECTOR_FIELD", &context->pipelineFiGameMotionVectorField));
+    FFX_VALIDATE(CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_OPTICAL_FLOW_VECTOR_FIELD,            L"OPTICAL_FLOW_VECTOR_FIELD", &context->pipelineFiOpticalFlowVectorField));
+    FFX_VALIDATE(CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_DISOCCLUSION_MASK,                    L"DISOCCLUSION_MASK", &context->pipelineFiDisocclusionMask));
+    FFX_VALIDATE(CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_INTERPOLATION,                        L"INTERPOLATION", &context->pipelineFiScfi));
+
+    const bool inpaintingPyramidAvailable = CreateOptionalComputePipeline(
+        FFX_FRAMEINTERPOLATION_PASS_INPAINTING_PYRAMID, L"INPAINTING_PYRAMID", &context->pipelineInpaintingPyramid);
+    if (inpaintingPyramidAvailable) {
+        if (!CreateOptionalComputePipeline(FFX_FRAMEINTERPOLATION_PASS_INPAINTING, L"INPAINTING", &context->pipelineInpainting)) {
+            ffxSafeReleasePipeline(&context->contextDescription.backendInterface, &context->pipelineInpaintingPyramid, context->effectContextId);
+            clearPipelineState(&context->pipelineInpaintingPyramid);
+        }
+        CreateOptionalComputePipeline(
+            FFX_FRAMEINTERPOLATION_PASS_GAME_VECTOR_FIELD_INPAINTING_PYRAMID,
+            L"GAME_VECTOR_FIELD_INPAINTING_PYRAMID",
+            &context->pipelineGameVectorFieldInpaintingPyramid);
+    } else {
+        clearPipelineState(&context->pipelineInpainting);
+        clearPipelineState(&context->pipelineGameVectorFieldInpaintingPyramid);
+    }
+
+    FFX_VALIDATE(CreateComputePipeline(FFX_FRAMEINTERPOLATION_PASS_DEBUG_VIEW,                           L"DEBUG_VIEW", &context->pipelineDebugView));
 
     return FFX_OK;
 }
@@ -495,8 +561,20 @@ static FfxErrorCode frameinterpolationRelease(FfxFrameInterpolationContext_Priva
     return FFX_OK;
 }
 
-static void scheduleDispatch(FfxFrameInterpolationContext_Private* context, const FfxPipelineState* pipeline, uint32_t dispatchX, uint32_t dispatchY)
+static constexpr uint32_t kInvalidInpaintingMipOverride = 0xffffffffu;
+
+static void scheduleDispatch(
+    FfxFrameInterpolationContext_Private* context,
+    const FfxPipelineState* pipeline,
+    uint32_t dispatchX,
+    uint32_t dispatchY,
+    uint32_t inpaintingPrevMipOverride = kInvalidInpaintingMipOverride,
+    uint32_t inpaintingDstMipOverride = kInvalidInpaintingMipOverride)
 {
+    if (!isPipelineValid(pipeline)) {
+        return;
+    }
+
     FfxComputeJobDescription jobDescriptor = {};
 
     for (uint32_t currentShaderResourceViewIndex = 0; currentShaderResourceViewIndex < pipeline->srvTextureCount; ++currentShaderResourceViewIndex)
@@ -516,7 +594,17 @@ static void scheduleDispatch(FfxFrameInterpolationContext_Private* context, cons
         wcscpy_s(jobDescriptor.uavTextureNames[currentUnorderedAccessViewIndex], pipeline->uavTextureBindings[currentUnorderedAccessViewIndex].name);
 #endif
 
-        if (currentResourceId >= FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_INPAINTING_PYRAMID_MIPMAP_0 && currentResourceId <= FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_INPAINTING_PYRAMID_MIPMAP_12)
+        const bool serialInpaintingPrev = wcscmp(pipeline->uavTextureBindings[currentUnorderedAccessViewIndex].name, L"rw_inpainting_pyramid_prev") == 0;
+        const bool serialInpaintingDst = wcscmp(pipeline->uavTextureBindings[currentUnorderedAccessViewIndex].name, L"rw_inpainting_pyramid_dst") == 0;
+        if (serialInpaintingPrev || serialInpaintingDst)
+        {
+            const FfxResourceInternal currentResource = context->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_INPAINTING_PYRAMID];
+            const uint32_t mipOverride = serialInpaintingPrev ? inpaintingPrevMipOverride : inpaintingDstMipOverride;
+            jobDescriptor.uavTextures[currentUnorderedAccessViewIndex] = currentResource;
+            jobDescriptor.uavTextureMips[currentUnorderedAccessViewIndex] =
+                (mipOverride == kInvalidInpaintingMipOverride) ? 0 : mipOverride;
+        }
+        else if (currentResourceId >= FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_INPAINTING_PYRAMID_MIPMAP_0 && currentResourceId <= FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_INPAINTING_PYRAMID_MIPMAP_12)
         {
             const FfxResourceInternal currentResource = context->uavResources[FFX_FRAMEINTERPOLATION_RESOURCE_IDENTIFIER_INPAINTING_PYRAMID];
             jobDescriptor.uavTextures[currentUnorderedAccessViewIndex] = currentResource;
@@ -564,6 +652,52 @@ static void scheduleDispatch(FfxFrameInterpolationContext_Private* context, cons
     dispatchJob.computeJobDescriptor = jobDescriptor;
 
     context->contextDescription.backendInterface.fpScheduleGpuJob(&context->contextDescription.backendInterface, &dispatchJob);
+}
+
+static uint32_t getSerialInpaintingMipCount(uint32_t width, uint32_t height)
+{
+    uint32_t mipCount = 1;
+    while ((width > 1 || height > 1) && mipCount < 10) {
+        width = std::max(1u, width / 2u);
+        height = std::max(1u, height / 2u);
+        ++mipCount;
+    }
+
+    return mipCount;
+}
+
+static void scheduleSerialInpaintingPyramid(
+    FfxFrameInterpolationContext_Private* context,
+    const FfxPipelineState* pipeline,
+    uint32_t baseWidth,
+    uint32_t baseHeight)
+{
+    if (!isSerialInpaintingPyramidPipeline(pipeline)) {
+        return;
+    }
+
+    uint32_t mipWidth = std::max(1u, baseWidth);
+    uint32_t mipHeight = std::max(1u, baseHeight);
+    const uint32_t mipCount = getSerialInpaintingMipCount(mipWidth, mipHeight);
+
+    for (uint32_t targetMip = 0; targetMip < mipCount; ++targetMip) {
+        context->inpaintingPyramidContants.mips = targetMip;
+        context->inpaintingPyramidContants.numworkGroups = 0;
+        context->inpaintingPyramidContants.workGroupOffset[0] = 0;
+        context->inpaintingPyramidContants.workGroupOffset[1] = 0;
+
+        memcpy(
+            &globalFrameInterpolationConstantBuffers[FFX_FRAMEINTERPOLATION_INPAINTING_PYRAMID_CONSTANTBUFFER_IDENTIFIER].data,
+            &context->inpaintingPyramidContants,
+            globalFrameInterpolationConstantBuffers[FFX_FRAMEINTERPOLATION_INPAINTING_PYRAMID_CONSTANTBUFFER_IDENTIFIER].num32BitEntries *
+                sizeof(uint32_t));
+
+        const uint32_t prevMip = targetMip == 0 ? std::min(1u, mipCount - 1u) : targetMip - 1u;
+        scheduleDispatch(context, pipeline, (mipWidth + 7u) / 8u, (mipHeight + 7u) / 8u, prevMip, targetMip);
+
+        mipWidth = std::max(1u, mipWidth / 2u);
+        mipHeight = std::max(1u, mipHeight / 2u);
+    }
 }
 
 FFX_API FfxErrorCode ffxFrameInterpolationGetSharedResourceDescriptions(FfxFrameInterpolationContext* context, FfxFrameInterpolationSharedResourceDescriptions* SharedResources)
@@ -942,6 +1076,15 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
 
             // game vector field inpainting pyramid
         auto scheduleDispatchGameVectorFieldInpaintingPyramid = [&]() {
+            if (isSerialInpaintingPyramidPipeline(&contextPrivate->pipelineGameVectorFieldInpaintingPyramid)) {
+                scheduleSerialInpaintingPyramid(
+                    contextPrivate,
+                    &contextPrivate->pipelineGameVectorFieldInpaintingPyramid,
+                    std::max(1u, params->renderSize.width / 2u),
+                    std::max(1u, params->renderSize.height / 2u));
+                return;
+            }
+
             // Auto exposure
             uint32_t dispatchThreadGroupCountXY[2];
             uint32_t workGroupOffset[2];
@@ -994,32 +1137,44 @@ FFX_API FfxErrorCode ffxFrameInterpolationDispatch(FfxFrameInterpolationContext*
         scheduleDispatch(contextPrivate, &contextPrivate->pipelineFiScfi, displayDispatchSizeX, displayDispatchSizeY);
 
         // inpainting pyramid
+        const bool inpaintingAvailable = isPipelineValid(&contextPrivate->pipelineInpaintingPyramid) && isPipelineValid(&contextPrivate->pipelineInpainting);
+        if (inpaintingAvailable)
         {
-            // Auto exposure
-            uint32_t dispatchThreadGroupCountXY[2];
-            uint32_t workGroupOffset[2];
-            uint32_t numWorkGroupsAndMips[2];
-            uint32_t rectInfo[4] = { 0, 0, params->displaySize.width, params->displaySize.height };
-            ffxSpdSetup(dispatchThreadGroupCountXY, workGroupOffset, numWorkGroupsAndMips, rectInfo);
+            if (isSerialInpaintingPyramidPipeline(&contextPrivate->pipelineInpaintingPyramid)) {
+                scheduleSerialInpaintingPyramid(
+                    contextPrivate,
+                    &contextPrivate->pipelineInpaintingPyramid,
+                    std::max(1u, params->displaySize.width / 2u),
+                    std::max(1u, params->displaySize.height / 2u));
+            } else {
+                // Auto exposure
+                uint32_t dispatchThreadGroupCountXY[2];
+                uint32_t workGroupOffset[2];
+                uint32_t numWorkGroupsAndMips[2];
+                uint32_t rectInfo[4] = { 0, 0, params->displaySize.width, params->displaySize.height };
+                ffxSpdSetup(dispatchThreadGroupCountXY, workGroupOffset, numWorkGroupsAndMips, rectInfo);
 
-            // downsample
-            contextPrivate->inpaintingPyramidContants.numworkGroups      = numWorkGroupsAndMips[0];
-            contextPrivate->inpaintingPyramidContants.mips               = numWorkGroupsAndMips[1];
-            contextPrivate->inpaintingPyramidContants.workGroupOffset[0] = workGroupOffset[0];
-            contextPrivate->inpaintingPyramidContants.workGroupOffset[1] = workGroupOffset[1];
+                // downsample
+                contextPrivate->inpaintingPyramidContants.numworkGroups      = numWorkGroupsAndMips[0];
+                contextPrivate->inpaintingPyramidContants.mips               = numWorkGroupsAndMips[1];
+                contextPrivate->inpaintingPyramidContants.workGroupOffset[0] = workGroupOffset[0];
+                contextPrivate->inpaintingPyramidContants.workGroupOffset[1] = workGroupOffset[1];
 
-            memcpy(&globalFrameInterpolationConstantBuffers[FFX_FRAMEINTERPOLATION_INPAINTING_PYRAMID_CONSTANTBUFFER_IDENTIFIER].data,
-                &contextPrivate->inpaintingPyramidContants,
-                globalFrameInterpolationConstantBuffers[FFX_FRAMEINTERPOLATION_INPAINTING_PYRAMID_CONSTANTBUFFER_IDENTIFIER].num32BitEntries * sizeof(uint32_t));
+                memcpy(&globalFrameInterpolationConstantBuffers[FFX_FRAMEINTERPOLATION_INPAINTING_PYRAMID_CONSTANTBUFFER_IDENTIFIER].data,
+                    &contextPrivate->inpaintingPyramidContants,
+                    globalFrameInterpolationConstantBuffers[FFX_FRAMEINTERPOLATION_INPAINTING_PYRAMID_CONSTANTBUFFER_IDENTIFIER].num32BitEntries * sizeof(uint32_t));
 
-            scheduleDispatch(contextPrivate, &contextPrivate->pipelineInpaintingPyramid, dispatchThreadGroupCountXY[0], dispatchThreadGroupCountXY[1]);
+                scheduleDispatch(contextPrivate, &contextPrivate->pipelineInpaintingPyramid, dispatchThreadGroupCountXY[0], dispatchThreadGroupCountXY[1]);
+            }
+
+            scheduleDispatch(contextPrivate, &contextPrivate->pipelineInpainting, displayDispatchSizeX, displayDispatchSizeY);
         }
 
-        scheduleDispatch(contextPrivate, &contextPrivate->pipelineInpainting, displayDispatchSizeX, displayDispatchSizeY);
-
-        if (params->flags & FFX_FRAMEINTERPOLATION_DISPATCH_DRAW_DEBUG_VIEW)
+        if ((params->flags & FFX_FRAMEINTERPOLATION_DISPATCH_DRAW_DEBUG_VIEW) && isPipelineValid(&contextPrivate->pipelineDebugView))
         {
-            scheduleDispatchGameVectorFieldInpaintingPyramid();
+            if (isPipelineValid(&contextPrivate->pipelineGameVectorFieldInpaintingPyramid)) {
+                scheduleDispatchGameVectorFieldInpaintingPyramid();
+            }
             scheduleDispatch(contextPrivate, &contextPrivate->pipelineDebugView, displayDispatchSizeX, displayDispatchSizeY);
         }
 

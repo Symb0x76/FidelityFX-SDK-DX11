@@ -957,6 +957,27 @@ void StorePyramid(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FfxFloat3
 
 #undef STORE
 }
+#elif defined(FSR3UPSCALER_BIND_UAV_SPD_MIPS_LEVEL_5)
+
+globallycoherent RWTexture2D<FfxFloat32x2>  rw_spd_mip5   : FFX_DECLARE_UAV(FSR3UPSCALER_BIND_UAV_SPD_MIPS_LEVEL_5);
+
+FfxFloat32x2 RWLoadPyramid(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FfxUInt32 index)
+{
+    if (index == 5)
+    {
+        return rw_spd_mip5[iPxPos];
+    }
+
+    return 0;
+}
+
+void StorePyramid(FFX_PARAMETER_IN FfxInt32x2 iPxPos, FFX_PARAMETER_IN FfxFloat32x2 outValue, FFX_PARAMETER_IN FfxUInt32 index)
+{
+    if (index == 5)
+    {
+        rw_spd_mip5[iPxPos] = outValue;
+    }
+}
 #endif
 
 #if defined FSR3UPSCALER_BIND_UAV_SPD_GLOBAL_ATOMIC

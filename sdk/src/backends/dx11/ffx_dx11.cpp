@@ -29,6 +29,13 @@
 #include <../src/backends/shared/ffx_shader_blobs.h>
 #include <codecvt>  // convert string to wstring
 #include <mutex>
+#include <cstdio>
+#if __has_include(<spdlog/spdlog.h>)
+#include <spdlog/spdlog.h>
+#define FFX_DX11_HAS_SPDLOG 1
+#else
+#define FFX_DX11_HAS_SPDLOG 0
+#endif
 
 extern "C" void CalculateDXBCChecksum(const DWORD* pData, DWORD dwSize, DWORD dwHash[4]);
 
@@ -204,21 +211,139 @@ static void SetNameDX11(ID3D11DeviceChild* resource, wchar_t const* name)
     }
 }
 
-static void TIF(HRESULT result)
+static void WideToAnsiDX11(wchar_t const* source, char* destination, size_t destinationSize)
+{
+    if (!destination || destinationSize == 0) {
+        return;
+    }
+
+    destination[0] = '\0';
+    if (!source) {
+        return;
+    }
+
+    size_t returnSize = 0;
+    wcstombs_s(&returnSize, destination, destinationSize, source, destinationSize - 1);
+}
+
+static uint32_t ResolveMipCountDX11(uint32_t width, uint32_t height, uint32_t depth, uint32_t requestedMipCount)
+{
+    if (requestedMipCount != 0) {
+        return requestedMipCount;
+    }
+
+    uint32_t maxDimension = width;
+    if (height > maxDimension) {
+        maxDimension = height;
+    }
+    if (depth > maxDimension) {
+        maxDimension = depth;
+    }
+
+    uint32_t mipCount = 1;
+    while (maxDimension > 1) {
+        maxDimension >>= 1;
+        ++mipCount;
+    }
+
+    return mipCount;
+}
+
+static void LogBackendFailureDX11(char const* call, unsigned int result, char const* resourceName, char const* errorMessage)
+{
+#if FFX_DX11_HAS_SPDLOG
+    spdlog::error("[FidelityFX_DX11] DX11 backend {} failed (hr=0x{:08X}, resource='{}'): {}",
+        call ? call : "call",
+        result,
+        resourceName ? resourceName : "",
+        errorMessage ? errorMessage : "");
+    spdlog::default_logger()->flush();
+#else
+    char message[512] = {};
+    std::snprintf(message, sizeof(message),
+        "[FidelityFX_DX11] DX11 backend %s failed (hr=0x%08X, resource='%s'): %s\n",
+        call ? call : "call",
+        result,
+        resourceName ? resourceName : "",
+        errorMessage ? errorMessage : "");
+    OutputDebugStringA(message);
+    std::fprintf(stderr, "%s", message);
+#endif
+}
+
+static void LogBufferViewFailureDX11(char const* resourceName, uint32_t size, uint32_t stride, bool zeroStride)
+{
+#if FFX_DX11_HAS_SPDLOG
+    if (zeroStride) {
+        spdlog::error("[FidelityFX_DX11] DX11 backend buffer view failed (resource='{}', size={}, stride=0)",
+            resourceName ? resourceName : "",
+            size);
+    } else {
+        spdlog::error("[FidelityFX_DX11] DX11 backend buffer view failed (resource='{}', size={}, stride={})",
+            resourceName ? resourceName : "",
+            size,
+            stride);
+    }
+    spdlog::default_logger()->flush();
+#else
+    char message[512] = {};
+    if (zeroStride) {
+        std::snprintf(message, sizeof(message),
+            "[FidelityFX_DX11] DX11 backend buffer view failed (resource='%s', size=%u, stride=0)\n",
+            resourceName ? resourceName : "",
+            size);
+    } else {
+        std::snprintf(message, sizeof(message),
+            "[FidelityFX_DX11] DX11 backend buffer view failed (resource='%s', size=%u, stride=%u)\n",
+            resourceName ? resourceName : "",
+            size,
+            stride);
+    }
+    OutputDebugStringA(message);
+    std::fprintf(stderr, "%s", message);
+#endif
+}
+
+static bool TIF(HRESULT result, char const* call, wchar_t const* resourceName = nullptr)
 {
     if (FAILED(result)) {
 
-        wchar_t errorMessage[256];
-        memset(errorMessage, 0, 256);
+        wchar_t errorMessage[256] = {};
         FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM, NULL, result, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), errorMessage, 255, NULL);
-        char errA[256];
-        size_t returnSize;
-        wcstombs_s(&returnSize, errA, 255, errorMessage, 255);
+        char errA[256] = {};
+        WideToAnsiDX11(errorMessage, errA, sizeof(errA));
+        char resourceNameA[128] = {};
+        WideToAnsiDX11(resourceName, resourceNameA, sizeof(resourceNameA));
 #ifdef _DEBUG
-        int32_t msgboxID = MessageBoxW(NULL, errorMessage, L"Error", MB_OK);
+        MessageBoxW(NULL, errorMessage, L"Error", MB_OK);
 #endif
-        throw 1;
+        LogBackendFailureDX11(call, static_cast<unsigned int>(result), resourceNameA, errA);
+        return false;
     }
+
+    return true;
+}
+
+static bool GetBufferElementCountDX11(const FfxResourceDescription& resourceDescription, wchar_t const* resourceName, uint32_t* elementCount)
+{
+    FFX_ASSERT(elementCount);
+    *elementCount = 0;
+
+    char resourceNameA[128] = {};
+    WideToAnsiDX11(resourceName, resourceNameA, sizeof(resourceNameA));
+
+    if (resourceDescription.stride == 0) {
+        LogBufferViewFailureDX11(resourceNameA, resourceDescription.size, resourceDescription.stride, true);
+        return false;
+    }
+
+    if (resourceDescription.size == 0 || (resourceDescription.size % resourceDescription.stride) != 0) {
+        LogBufferViewFailureDX11(resourceNameA, resourceDescription.size, resourceDescription.stride, false);
+        return false;
+    }
+
+    *elementCount = resourceDescription.size / resourceDescription.stride;
+    return true;
 }
 
 // fix up format in case resource passed for UAV cannot be mapped
@@ -719,13 +844,17 @@ FfxErrorCode CreateBackendContextDX11(FfxInterface* backendInterface, FfxUInt32*
         constDesc.Usage = D3D11_USAGE_DYNAMIC;
         constDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         constDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        TIF(dx11Device->CreateBuffer(&constDesc, nullptr, &backendContext->constantBufferResource[0]));
+        if (!TIF(dx11Device->CreateBuffer(&constDesc, nullptr, &backendContext->constantBufferResource[0]), "CreateBuffer", L"FFX_DX11_DynamicRingBuffer")) {
+            return FFX_ERROR_BACKEND_API_ERROR;
+        }
         SetNameDX11(backendContext->constantBufferResource[0], L"FFX_DX11_DynamicRingBuffer");
 
         // map it
         D3D11_MAPPED_SUBRESOURCE mappedSubresource = {};
-        TIF(backendContext->deviceContext->Map(backendContext->constantBufferResource[0], 0,
-            D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mappedSubresource));
+        if (!TIF(backendContext->deviceContext->Map(backendContext->constantBufferResource[0], 0,
+            D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mappedSubresource), "Map", L"FFX_DX11_DynamicRingBuffer")) {
+            return FFX_ERROR_BACKEND_API_ERROR;
+        }
         backendContext->constantBufferMem[0] = mappedSubresource.pData;
         backendContext->constantBufferOffset[0] = 0;
     }
@@ -756,42 +885,16 @@ FfxErrorCode GetDeviceCapabilitiesDX11(FfxInterface* backendInterface, FfxDevice
     FFX_ASSERT(NULL != backendInterface);
     FFX_ASSERT(NULL != backendInterface->device);
     FFX_ASSERT(NULL != deviceCapabilities);
-    ID3D11Device* dx11Device = reinterpret_cast<ID3D11Device*>(backendInterface->device);
 
-    // Check if we have shader model 6.6
-    D3D_FEATURE_LEVEL shaderModel = dx11Device->GetFeatureLevel();
-    switch (shaderModel) {
-
-    case D3D_FEATURE_LEVEL_10_0:
-    case D3D_FEATURE_LEVEL_10_1:
-    case D3D_FEATURE_LEVEL_11_0:
-    case D3D_FEATURE_LEVEL_11_1:
-        deviceCapabilities->minimumSupportedShaderModel = FFX_SHADER_MODEL_5_1;
-        break;
-
-    case D3D_FEATURE_LEVEL_12_0:
-        deviceCapabilities->minimumSupportedShaderModel = FFX_SHADER_MODEL_6_0;
-        break;
-
-    case D3D_FEATURE_LEVEL_12_1:
-        deviceCapabilities->minimumSupportedShaderModel = FFX_SHADER_MODEL_6_3;
-        break;
-
-    case D3D_FEATURE_LEVEL_12_2:
-        deviceCapabilities->minimumSupportedShaderModel = FFX_SHADER_MODEL_6_5;
-        break;
-
-    default:
-        deviceCapabilities->minimumSupportedShaderModel = FFX_SHADER_MODEL_6_6;
-        break;
-    }
-
-    // check if we have 16bit floating point.
-    D3D11_FEATURE_DATA_SHADER_MIN_PRECISION_SUPPORT d3d11Options = {};
-    if (SUCCEEDED(dx11Device->CheckFeatureSupport(D3D11_FEATURE_SHADER_MIN_PRECISION_SUPPORT, &d3d11Options, sizeof(d3d11Options)))) {
-
-        deviceCapabilities->fp16Supported = (d3d11Options.AllOtherShaderStagesMinPrecision != 0);
-    }
+    // The DX11 backend only ships cs_5_0 DXBC blobs. Keep the reported
+    // capabilities conservative so effects do not select FP16 or wave64
+    // permutations that D3D11 CreateComputeShader can reject at runtime.
+    *deviceCapabilities = {};
+    deviceCapabilities->minimumSupportedShaderModel = FFX_SHADER_MODEL_5_1;
+    deviceCapabilities->waveLaneCountMin = 0;
+    deviceCapabilities->waveLaneCountMax = 0;
+    deviceCapabilities->fp16Supported = false;
+    deviceCapabilities->raytracingSupported = false;
 
     return FFX_OK;
 }
@@ -894,6 +997,10 @@ FfxErrorCode CreateResourceDX11(
         dx11BufferDescription.ByteWidth = createResourceDescription->resourceDescription.width;
         dx11BufferDescription.Usage = D3D11_USAGE_DEFAULT;
         dx11BufferDescription.BindFlags = ffxGetDX11BindFlags(backendResource->resourceDescription.usage);
+        if (createResourceDescription->resourceDescription.stride > 0) {
+            dx11BufferDescription.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+            dx11BufferDescription.StructureByteStride = createResourceDescription->resourceDescription.stride;
+        }
         break;
 
     case FFX_RESOURCE_TYPE_TEXTURE1D:
@@ -933,6 +1040,28 @@ FfxErrorCode CreateResourceDX11(
     }
 
     ID3D11Resource* dx11Resource = nullptr;
+    auto failCreateResource = [&]() -> FfxErrorCode {
+        if (backendResource->srvPtr) {
+            backendResource->srvPtr->Release();
+            backendResource->srvPtr = nullptr;
+        }
+
+        for (uint32_t currentMipIndex = 0; currentMipIndex < FFX_ARRAY_ELEMENTS(backendResource->uavPtr); ++currentMipIndex) {
+            if (backendResource->uavPtr[currentMipIndex]) {
+                backendResource->uavPtr[currentMipIndex]->Release();
+                backendResource->uavPtr[currentMipIndex] = nullptr;
+            }
+        }
+
+        if (dx11Resource) {
+            dx11Resource->Release();
+            dx11Resource = nullptr;
+        }
+
+        backendResource->resourcePtr = nullptr;
+        return FFX_ERROR_BACKEND_API_ERROR;
+    };
+
     if (createResourceDescription->heapType == FFX_HEAP_TYPE_UPLOAD) {
 
         return FFX_OK;
@@ -952,24 +1081,41 @@ FfxErrorCode CreateResourceDX11(
         switch (createResourceDescription->resourceDescription.type) {
 
         case FFX_RESOURCE_TYPE_BUFFER:
-            TIF(dx11Device->CreateBuffer(&dx11BufferDescription, pSubResourceData, (ID3D11Buffer**)&dx11Resource));
+            if (!TIF(dx11Device->CreateBuffer(&dx11BufferDescription, pSubResourceData, (ID3D11Buffer**)&dx11Resource), "CreateBuffer", createResourceDescription->name)) {
+                return failCreateResource();
+            }
             break;
 
         case FFX_RESOURCE_TYPE_TEXTURE1D:
-            TIF(dx11Device->CreateTexture1D(&dx11Texture1DDescription, pSubResourceData, (ID3D11Texture1D**)&dx11Resource));
+            dx11Texture1DDescription.MipLevels = ResolveMipCountDX11(
+                dx11Texture1DDescription.Width, 1, dx11Texture1DDescription.ArraySize, dx11Texture1DDescription.MipLevels);
+            backendResource->resourceDescription.mipCount = dx11Texture1DDescription.MipLevels;
+            if (!TIF(dx11Device->CreateTexture1D(&dx11Texture1DDescription, pSubResourceData, (ID3D11Texture1D**)&dx11Resource), "CreateTexture1D", createResourceDescription->name)) {
+                return failCreateResource();
+            }
             break;
 
         case FFX_RESOURCE_TYPE_TEXTURE_CUBE:
         case FFX_RESOURCE_TYPE_TEXTURE2D:
             dx11SubResourceData.SysMemPitch /= dx11Texture2DDescription.Height;
-            TIF(dx11Device->CreateTexture2D(&dx11Texture2DDescription, pSubResourceData, (ID3D11Texture2D**)&dx11Resource));
+            dx11Texture2DDescription.MipLevels = ResolveMipCountDX11(
+                dx11Texture2DDescription.Width, dx11Texture2DDescription.Height, dx11Texture2DDescription.ArraySize, dx11Texture2DDescription.MipLevels);
+            backendResource->resourceDescription.mipCount = dx11Texture2DDescription.MipLevels;
+            if (!TIF(dx11Device->CreateTexture2D(&dx11Texture2DDescription, pSubResourceData, (ID3D11Texture2D**)&dx11Resource), "CreateTexture2D", createResourceDescription->name)) {
+                return failCreateResource();
+            }
             break;
 
         case FFX_RESOURCE_TYPE_TEXTURE3D:
             dx11SubResourceData.SysMemPitch /= dx11Texture3DDescription.Height;
             dx11SubResourceData.SysMemPitch /= dx11Texture3DDescription.Depth;
             dx11SubResourceData.SysMemSlicePitch /= dx11Texture3DDescription.Depth;
-            TIF(dx11Device->CreateTexture3D(&dx11Texture3DDescription, pSubResourceData, (ID3D11Texture3D**)&dx11Resource));
+            dx11Texture3DDescription.MipLevels = ResolveMipCountDX11(
+                dx11Texture3DDescription.Width, dx11Texture3DDescription.Height, dx11Texture3DDescription.Depth, dx11Texture3DDescription.MipLevels);
+            backendResource->resourceDescription.mipCount = dx11Texture3DDescription.MipLevels;
+            if (!TIF(dx11Device->CreateTexture3D(&dx11Texture3DDescription, pSubResourceData, (ID3D11Texture3D**)&dx11Resource), "CreateTexture3D", createResourceDescription->name)) {
+                return failCreateResource();
+            }
             break;
 
         default:
@@ -1086,26 +1232,36 @@ FfxErrorCode CreateResourceDX11(
             }
 
             if (resourceDimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+                uint32_t bufferElementCount = 0;
+                if (!GetBufferElementCountDX11(backendResource->resourceDescription, createResourceDescription->name, &bufferElementCount)) {
+                    return failCreateResource();
+                }
 
                 // UAV
                 if (dx11BufferDescription.BindFlags & D3D11_BIND_UNORDERED_ACCESS) {
 
                     dx11UavDescription.Buffer.FirstElement = 0;
-                    dx11UavDescription.Buffer.NumElements = backendResource->resourceDescription.size / backendResource->resourceDescription.stride;
+                    dx11UavDescription.Buffer.NumElements = bufferElementCount;
 
-                    TIF(dx11Device->CreateUnorderedAccessView(dx11Resource, &dx11UavDescription, &backendResource->uavPtr[0]));
+                    if (!TIF(dx11Device->CreateUnorderedAccessView(dx11Resource, &dx11UavDescription, &backendResource->uavPtr[0]), "CreateUnorderedAccessView", createResourceDescription->name)) {
+                        return failCreateResource();
+                    }
                 }
                 else
                 {
                     dx11SrvDescription.Buffer.FirstElement = 0;
-                    dx11SrvDescription.Buffer.NumElements = backendResource->resourceDescription.size / backendResource->resourceDescription.stride;
+                    dx11SrvDescription.Buffer.NumElements = bufferElementCount;
 
-                    TIF(dx11Device->CreateShaderResourceView(dx11Resource, &dx11SrvDescription, &backendResource->srvPtr));
+                    if (!TIF(dx11Device->CreateShaderResourceView(dx11Resource, &dx11SrvDescription, &backendResource->srvPtr), "CreateShaderResourceView", createResourceDescription->name)) {
+                        return failCreateResource();
+                    }
                 }
             }
             else {
                 // CPU readable
-                TIF(dx11Device->CreateShaderResourceView(dx11Resource, &dx11SrvDescription, &backendResource->srvPtr));
+                if (!TIF(dx11Device->CreateShaderResourceView(dx11Resource, &dx11SrvDescription, &backendResource->srvPtr), "CreateShaderResourceView", createResourceDescription->name)) {
+                    return failCreateResource();
+                }
 
                 // UAV
                 if (dx11Texture1DDescription.BindFlags & D3D11_BIND_UNORDERED_ACCESS ||
@@ -1118,7 +1274,9 @@ FfxErrorCode CreateResourceDX11(
 
                         dx11UavDescription.Texture2D.MipSlice = currentMipIndex;
 
-                        dx11Device->CreateUnorderedAccessView(dx11Resource, &dx11UavDescription, &backendResource->uavPtr[currentMipIndex]);
+                        if (!TIF(dx11Device->CreateUnorderedAccessView(dx11Resource, &dx11UavDescription, &backendResource->uavPtr[currentMipIndex]), "CreateUnorderedAccessView", createResourceDescription->name)) {
+                            return failCreateResource();
+                        }
                     }
                 }
             }
@@ -1186,6 +1344,11 @@ FfxErrorCode RegisterResourceDX11(
     outFfxResourceInternal->internalIndex = effectContext.nextDynamicResource--;
 
     BackendContext_DX11::Resource* backendResource = &backendContext->pResources[outFfxResourceInternal->internalIndex];
+    const wchar_t* resourceName = inFfxResource->name;
+    auto failRegisterResource = [&]() -> FfxErrorCode {
+        DestroyResourceDX11(backendInterface, *outFfxResourceInternal, effectContextId);
+        return FFX_ERROR_BACKEND_API_ERROR;
+    };
 
     if (backendResource->resourcePtr == dx11Resource)
     {
@@ -1199,9 +1362,8 @@ FfxErrorCode RegisterResourceDX11(
         backendResource->resourcePtr->AddRef();
 
 #ifdef _DEBUG
-    const wchar_t* name = inFfxResource->name;
-    if (name) {
-        wcscpy_s(backendResource->resourceName, name);
+    if (resourceName) {
+        wcscpy_s(backendResource->resourceName, resourceName);
     }
 #endif
 
@@ -1333,27 +1495,37 @@ FfxErrorCode RegisterResourceDX11(
         }
 
         if (resourceDimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+            uint32_t bufferElementCount = 0;
+            if (!GetBufferElementCountDX11(backendResource->resourceDescription, resourceName, &bufferElementCount)) {
+                return failRegisterResource();
+            }
 
             // UAV
             if (dx11BufferDesc.BindFlags & D3D11_BIND_UNORDERED_ACCESS) {
 
                 dx11UavDescription.Buffer.FirstElement = 0;
-                dx11UavDescription.Buffer.NumElements = backendResource->resourceDescription.size / backendResource->resourceDescription.stride;
+                dx11UavDescription.Buffer.NumElements = bufferElementCount;
 
-                TIF(dx11Device->CreateUnorderedAccessView(dx11Resource, &dx11UavDescription, &backendResource->uavPtr[0]));
+                if (!TIF(dx11Device->CreateUnorderedAccessView(dx11Resource, &dx11UavDescription, &backendResource->uavPtr[0]), "CreateUnorderedAccessView", resourceName)) {
+                    return failRegisterResource();
+                }
             }
             else
             {
                 dx11SrvDescription.Buffer.FirstElement        = 0;
-                dx11SrvDescription.Buffer.NumElements         = backendResource->resourceDescription.size / backendResource->resourceDescription.stride;
+                dx11SrvDescription.Buffer.NumElements         = bufferElementCount;
 
-                TIF(dx11Device->CreateShaderResourceView(dx11Resource, &dx11SrvDescription, &backendResource->srvPtr));
+                if (!TIF(dx11Device->CreateShaderResourceView(dx11Resource, &dx11SrvDescription, &backendResource->srvPtr), "CreateShaderResourceView", resourceName)) {
+                    return failRegisterResource();
+                }
             }
         }
         else {
 
             // CPU readable
-            TIF(dx11Device->CreateShaderResourceView(dx11Resource, &dx11SrvDescription, &backendResource->srvPtr));
+            if (!TIF(dx11Device->CreateShaderResourceView(dx11Resource, &dx11SrvDescription, &backendResource->srvPtr), "CreateShaderResourceView", resourceName)) {
+                return failRegisterResource();
+            }
 
             // UAV
             if (dx11Texture1DDesc.BindFlags & D3D11_BIND_UNORDERED_ACCESS ||
@@ -1381,7 +1553,9 @@ FfxErrorCode RegisterResourceDX11(
                         break;
                     }
 
-                    dx11Device->CreateUnorderedAccessView(dx11Resource, &dx11UavDescription, &backendResource->uavPtr[currentMipIndex]);
+                    if (!TIF(dx11Device->CreateUnorderedAccessView(dx11Resource, &dx11UavDescription, &backendResource->uavPtr[currentMipIndex]), "CreateUnorderedAccessView", resourceName)) {
+                        return failRegisterResource();
+                    }
                 }
             }
         }
@@ -1566,7 +1740,7 @@ FfxErrorCode CreatePipelineDX11(
         }
 
         // create the PSO
-        if (FAILED(dx11Device->CreateComputeShader(data, shaderBlob.size, nullptr, (ID3D11ComputeShader**)&outPipeline->pipeline)))
+        if (!TIF(dx11Device->CreateComputeShader(data, shaderBlob.size, nullptr, (ID3D11ComputeShader**)&outPipeline->pipeline), "CreateComputeShader", pipelineDescription->name))
         {
             delete[] data;
             return FFX_ERROR_BACKEND_API_ERROR;
@@ -1791,14 +1965,18 @@ static FfxErrorCode executeGpuJobCompute(BackendContext_DX11* backendContext, Ff
                     constDesc.Usage = D3D11_USAGE_DYNAMIC;
                     constDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
                     constDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-                    TIF(dx11Device->CreateBuffer(&constDesc, nullptr, &backendContext->constantBufferResource[currentRootConstantIndex]));
+                    if (!TIF(dx11Device->CreateBuffer(&constDesc, nullptr, &backendContext->constantBufferResource[currentRootConstantIndex]), "CreateBuffer", L"FFX_DX11_ConstantBuffer")) {
+                        return FFX_ERROR_BACKEND_API_ERROR;
+                    }
                     SetNameDX11(backendContext->constantBufferResource[currentRootConstantIndex], L"FFX_DX11_ConstantBuffer");
                 }
 
                 if (backendContext->constantBufferResource[currentRootConstantIndex] != NULL) {
 
                     D3D11_MAPPED_SUBRESOURCE mappedSubresource = {};
-                    TIF(backendContext->deviceContext->Map(backendContext->constantBufferResource[currentRootConstantIndex], 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedSubresource));
+                    if (!TIF(backendContext->deviceContext->Map(backendContext->constantBufferResource[currentRootConstantIndex], 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedSubresource), "Map", L"FFX_DX11_ConstantBuffer")) {
+                        return FFX_ERROR_BACKEND_API_ERROR;
+                    }
 
                     if (mappedSubresource.pData) {
                         memcpy(mappedSubresource.pData, job->computeJobDescriptor.cbs[currentRootConstantIndex].data, job->computeJobDescriptor.cbs[currentRootConstantIndex].num32BitEntries * sizeof(uint32_t));
