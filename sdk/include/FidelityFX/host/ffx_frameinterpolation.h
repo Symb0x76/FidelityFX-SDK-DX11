@@ -118,6 +118,7 @@ typedef struct FfxFrameInterpolationContextDescription {
     FfxDimensions2D                 maxRenderSize;          ///< The maximum size that rendering will be performed at.
     FfxDimensions2D                 displaySize;            ///< The size of the presentation resolution
     FfxSurfaceFormat                backBufferFormat;
+    FfxSurfaceFormat                previousInterpolationSourceFormat; ///< the format of the texture that will store the interpolation source for the next frame. Can be different than the backbuffer one, especially when using hudless
     FfxInterface                    backendInterface;       ///< A set of pointers to the backend implementation for FidelityFX SDK
 } FfxFrameInterpolationContextDescription;
 

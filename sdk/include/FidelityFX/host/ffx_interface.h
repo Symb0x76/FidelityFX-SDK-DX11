@@ -387,6 +387,7 @@ typedef struct FfxFrameGenerationConfig
     FfxResource                     HUDLessColor;
     FfxUInt32                       flags;
     bool                            onlyPresentInterpolated;
+    bool                            drawDebugPacingLines;            ///< Sets the state of pacing debug lines. Set to true to display debug lines
 } FfxFrameGenerationConfig;
 
 typedef FfxErrorCode (*ffxSwapChainConfigureFrameGenerationFunc)(FfxFrameGenerationConfig const* config);
